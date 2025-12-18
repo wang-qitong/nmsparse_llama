@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+nmSPARSE 测试工具函数
+封装了加载权重、剪枝、转换、测试等核心功能，用于批量测试
+"""
+
+import os
+import sys
+import time
+import torch
+import numpy as np
+from typing import Dict, Optional, Tuple
+
+def load_and_prune_weight(
+    model,
+    layer_idx: int,
+    weight_name: str,
+    sparsity: float,
+    num_bank_val: int = 32
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """
+    从模型中提取权重并进行bank-aware剪枝
+    
+    Args:
+        model: 已加载的LLaMA模型
+        layer_idx: 层索引
+        weight_name: 权重名称 (o_proj, down_proj, q_proj, k_proj, v_proj, gate_proj, up_proj)
+        sparsity: 稀疏率 (0.0-1.0)
+        num_bank_val: 每个bank的元素数
+    
+    Returns:
+        (real_weight, pruned_weight, pruned_mask, K, N)
+        - real_weight: [K, N] 原始权重
+        - pruned_weight: [K, N] 剪枝后权重
+        - pruned_mask: [K, N] 剪枝mask
+        - K: 输入维度
+        - N: 输出维度
+    """
+    # 提取权重
+    if weight_name == "q_proj":
+        weight_module = model.model.layers[layer_idx].self_attn.q_proj
+    elif weight_name == "k_proj":
+        weight_module = model.model.layers[layer_idx].self_attn.k_proj
+    elif weight_name == "v_proj":
+        weight_module = model.model.layers[layer_idx].self_attn.v_proj
+    elif weight_name == "o_proj":
+        weight_module = model.model.layers[layer_idx].self_attn.o_proj
+    elif weight_name == "gate_proj":
+        weight_module = model.model.layers[layer_idx].mlp.gate_proj
+    elif weight_name == "up_proj":
+        weight_module = model.model.layers[layer_idx].mlp.up_proj
+    elif weight_name == "down_proj":
+        weight_module = model.model.layers[layer_idx].mlp.down_proj
+    else:
+        raise ValueError(f"未知的权重名称: {weight_name}")
+    
+    # 将权重移到 CPU 进行剪枝，避免 GPU 显存暴涨
+    # 重要：先 .cpu() 再 .clone()，避免在 GPU 上 clone 导致 OOM
+    W = weight_module.weight.data.cpu().clone()  # [out, in] → CPU
+    real_weight = W.t().contiguous()  # [K, N] = [in, out]，在 CPU 上
+    
+    K, N = real_weight.shape
+    
+    # 验证维度
+    assert K % num_bank_val == 0, f"K={K} 必须是 NUM_BANK_VAL={num_bank_val} 的倍数"
+    
+    # Bank-aware 剪枝（在 CPU 上进行，节省 GPU 显存）
+    pruned_mask = torch.zeros_like(real_weight)
+    num_keep_per_bank = int(num_bank_val * (1 - sparsity))
+    num_bank = K // num_bank_val
+    
+    for col_idx in range(N):
+        for bank_id in range(num_bank):
+            start_idx = bank_id * num_bank_val
+            end_idx = start_idx + num_bank_val
+            
+            bank_weights = real_weight[start_idx:end_idx, col_idx]
+            _, top_indices = torch.topk(bank_weights.abs(), num_keep_per_bank)
+            top_indices = top_indices.sort()[0]
+            
+            pruned_mask[start_idx + top_indices, col_idx] = 1.0
+    
+    pruned_weight = real_weight * pruned_mask
+    
+    return real_weight, pruned_weight, pruned_mask, K, N
+
+
+def capture_real_activation(
+    model,
+    tokenizer,
+    layer_idx: int,
+    weight_name: str,
+    prompt_text: str = "The future of artificial intelligence is"
+) -> Optional[torch.Tensor]:
+    """
+    捕获真实的activation
+    
+    Args:
+        model: LLaMA模型
+        tokenizer: Tokenizer
+        layer_idx: 层索引
+        weight_name: 权重名称
+        prompt_text: 输入文本
+    
+    Returns:
+        activation: [1, hidden_size] 或 None（如果失败）
+    """
+    try:
+        # Tokenize
+        inputs = tokenizer(prompt_text, return_tensors="pt")
+        input_ids = inputs["input_ids"]
+        
+        # 准备hook
+        captured_activation = []
+        
+        def capture_hook(module, input, output):
+            act = input[0].detach().cpu()
+            captured_activation.append(act)
+        
+        # 注册hook
+        if weight_name == "q_proj":
+            target_module = model.model.layers[layer_idx].self_attn.q_proj
+        elif weight_name == "k_proj":
+            target_module = model.model.layers[layer_idx].self_attn.k_proj
+        elif weight_name == "v_proj":
+            target_module = model.model.layers[layer_idx].self_attn.v_proj
+        elif weight_name == "o_proj":
+            target_module = model.model.layers[layer_idx].self_attn.o_proj
+        elif weight_name == "gate_proj":
+            target_module = model.model.layers[layer_idx].mlp.gate_proj
+        elif weight_name == "up_proj":
+            target_module = model.model.layers[layer_idx].mlp.up_proj
+        elif weight_name == "down_proj":
+            target_module = model.model.layers[layer_idx].mlp.down_proj
+        else:
+            return None
+        
+        handle = target_module.register_forward_hook(capture_hook)
+        
+        # 运行推理
+        with torch.no_grad():
+            _ = model(input_ids)
+        
+        handle.remove()
+        
+        # 提取activation
+        if len(captured_activation) > 0:
+            act = captured_activation[0]
+            real_activation = act[:, -1, :].contiguous()
+            return real_activation
+        
+        return None
+        
+    except Exception as e:
+        print(f"⚠️ 捕获activation失败: {e}")
+        return None
+
+
+def convert_to_sparse_format(
+    weight: torch.Tensor,
+    mask: torch.Tensor,
+    num_bank_val: int = 32
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    将剪枝后的权重转换为bank-aware稀疏格式
+    
+    Args:
+        weight: [K, N] 权重矩阵（应在 CPU 上）
+        mask: [K, N] 剪枝mask（应在 CPU 上）
+        num_bank_val: 每个bank的元素数
+    
+    Returns:
+        (mat_data, mat_index)
+        - mat_data: [w, N] 稀疏矩阵值（在 CPU 上）
+        - mat_index: [w, N] 稀疏矩阵索引（在 CPU 上）
+    """
+    # 确保输入在 CPU 上
+    if weight.is_cuda:
+        weight = weight.cpu()
+    if mask.is_cuda:
+        mask = mask.cpu()
+    
+    K, N = weight.shape
+    num_banks = K // num_bank_val
+    num_nonzeros_per_bank = int((mask[:num_bank_val, 0].sum().item()))
+    w = num_banks * num_nonzeros_per_bank
+    
+    # 显式在 CPU 上创建
+    mat_data = torch.zeros(w, N, dtype=torch.float32, device='cpu')
+    mat_index = torch.zeros(w, N, dtype=torch.int32, device='cpu')
+    
+    for col_idx in range(N):
+        for bank_id in range(num_banks):
+            bank_start = bank_id * num_bank_val
+            bank_end = bank_start + num_bank_val
+            
+            bank_weight = weight[bank_start:bank_end, col_idx]
+            bank_mask = mask[bank_start:bank_end, col_idx]
+            
+            nonzero_local_idx = torch.where(bank_mask > 0)[0]
+            
+            # 严格验证：非零个数必须匹配，否则报错
+            if len(nonzero_local_idx) != num_nonzeros_per_bank:
+                raise ValueError(
+                    f"Bank {bank_id} 列 {col_idx} 的非零元素个数不匹配！\n"
+                    f"  期望: {num_nonzeros_per_bank}\n"
+                    f"  实际: {len(nonzero_local_idx)}\n"
+                    f"  这表明剪枝过程没有保证每个 bank 有相同数量的非零元素。\n"
+                    f"  请检查 load_and_prune_weight() 函数的剪枝逻辑。"
+                )
+            
+            nonzero_local_idx = nonzero_local_idx.sort()[0]
+            global_idx = bank_start + nonzero_local_idx
+            
+            row_start = bank_id * num_nonzeros_per_bank
+            row_end = row_start + num_nonzeros_per_bank
+            
+            mat_data[row_start:row_end, col_idx] = bank_weight[nonzero_local_idx]
+            mat_index[row_start:row_end, col_idx] = global_idx.int()
+    
+    return mat_data, mat_index
+
+
+def benchmark_sparse_kernel(
+    nmsparse_module,
+    vec_gpu: torch.Tensor,
+    mat_data_gpu: torch.Tensor,
+    mat_index_gpu: torch.Tensor,
+    w: int,
+    h: int,
+    block_width: int,
+    num_threads: int,
+    vec_width: int,
+    minibatch: int,
+    vecNum: int,
+    num_warmup: int = 10,
+    num_iters: int = 100
+) -> Tuple[float, torch.Tensor]:
+    """
+    测试稀疏kernel性能
+    
+    Returns:
+        (avg_time_ms, output)
+    """
+    # 预热
+    for _ in range(num_warmup):
+        _ = nmsparse_module.forward(
+            vec_gpu, mat_data_gpu, mat_index_gpu,
+            w, h, block_width, num_threads, vec_width, minibatch, vecNum
+        )
+    torch.cuda.synchronize()
+    
+    # 性能测试
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    torch.cuda.synchronize()
+    start_event.record()
+    
+    for _ in range(num_iters):
+        output_gpu = nmsparse_module.forward(
+            vec_gpu, mat_data_gpu, mat_index_gpu,
+            w, h, block_width, num_threads, vec_width, minibatch, vecNum
+        )
+    
+    end_event.record()
+    torch.cuda.synchronize()
+    
+    avg_time = start_event.elapsed_time(end_event) / num_iters
+    
+    return avg_time, output_gpu
+
+
+def benchmark_dense_gemv(
+    vec_gpu: torch.Tensor,
+    weight_gpu: torch.Tensor,
+    num_warmup: int = 10,
+    num_iters: int = 100
+) -> Tuple[float, torch.Tensor]:
+    """
+    测试dense GEMV性能
+    
+    Returns:
+        (avg_time_ms, output)
+    """
+    # 预热
+    for _ in range(num_warmup):
+        _ = vec_gpu @ weight_gpu
+    torch.cuda.synchronize()
+    
+    # 性能测试
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    torch.cuda.synchronize()
+    start_event.record()
+    
+    for _ in range(num_iters):
+        output = vec_gpu @ weight_gpu
+    
+    end_event.record()
+    torch.cuda.synchronize()
+    
+    avg_time = start_event.elapsed_time(end_event) / num_iters
+    
+    return avg_time, output
+
+
+def run_one_test(
+    model,
+    nmsparse_module,
+    tokenizer,
+    layer_idx: int,
+    weight_name: str,
+    sparsity: float = 0.5,
+    use_real_activation: bool = True,
+    prompt_text: str = "The future of artificial intelligence is",
+    num_iters: int = 100,
+    device: str = 'cuda',
+    num_bank_val: int = 32,
+    num_threads: int = 128,
+    verbose: bool = False
+) -> Dict:
+    """
+    运行单次稀疏化测试
+    
+    Args:
+        model: 预加载的LLaMA模型
+        nmsparse_module: 预编译的kernel模块
+        tokenizer: Tokenizer
+        layer_idx: 层索引
+        weight_name: 权重名称
+        sparsity: 稀疏率
+        use_real_activation: 是否使用真实activation
+        prompt_text: 用于捕获activation的文本
+        num_iters: 测试迭代次数
+        device: 设备
+        num_bank_val: 每个bank的元素数
+        num_threads: CUDA线程数
+        verbose: 是否打印详细信息
+    
+    Returns:
+        dict: 测试结果
+    """
+    result = {
+        'layer_idx': layer_idx,
+        'weight_name': weight_name,
+        'sparsity': sparsity,
+        'success': False,
+        'error_msg': None
+    }
+    
+    try:
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"测试: layer={layer_idx}, weight={weight_name}, sparsity={sparsity}")
+            print(f"{'='*70}")
+        
+        # Step 1: 加载和剪枝权重
+        if verbose:
+            print("Step 1: 加载和剪枝权重...")
+        
+        real_weight, pruned_weight, pruned_mask, K, N = load_and_prune_weight(
+            model, layer_idx, weight_name, sparsity, num_bank_val
+        )
+        
+        result['shape_K'] = K
+        result['shape_N'] = N
+        
+        if verbose:
+            print(f"  权重形状: [{K}, {N}]")
+            print(f"  稀疏率: {1 - pruned_mask.sum() / pruned_mask.numel():.4f}")
+        
+        # Step 2: 捕获activation或生成随机向量
+        if use_real_activation:
+            if verbose:
+                print("Step 2: 捕获真实activation...")
+            real_activation = capture_real_activation(
+                model, tokenizer, layer_idx, weight_name, prompt_text
+            )
+            if real_activation is not None:
+                vec_gpu = real_activation.to(device)
+                result['use_real_activation'] = True
+            else:
+                vec_gpu = torch.randn(1, K, dtype=torch.float32, device=device)
+                result['use_real_activation'] = False
+        else:
+            vec_gpu = torch.randn(1, K, dtype=torch.float32, device=device)
+            result['use_real_activation'] = False
+        
+        # Step 3: 转换为稀疏格式
+        if verbose:
+            print("Step 3: 转换为稀疏格式...")
+        
+        mat_data_cpu, mat_index_cpu = convert_to_sparse_format(
+            pruned_weight, pruned_mask, num_bank_val
+        )
+        mat_data_gpu = mat_data_cpu.to(device)
+        mat_index_gpu = mat_index_cpu.to(device)
+        
+        # 计算参数
+        num_bank = K // num_bank_val
+        w = int(K * (1 - sparsity))
+        h = N
+        block_width = w // num_bank
+        vec_width = K * block_width // w
+        minibatch = 1
+        vecNum = K
+        
+        # Step 4: 测试稀疏kernel
+        if verbose:
+            print("Step 4: 测试稀疏kernel...")
+        
+        sparse_time, sparse_output = benchmark_sparse_kernel(
+            nmsparse_module, vec_gpu, mat_data_gpu, mat_index_gpu,
+            w, h, block_width, num_threads, vec_width, minibatch, vecNum,
+            num_warmup=10, num_iters=num_iters
+        )
+        
+        result['sparse_time_ms'] = sparse_time
+        
+        # Step 5: 测试dense baseline（剪枝后）
+        if verbose:
+            print("Step 5: 测试dense GEMV (pruned)...")
+        
+        pruned_weight_gpu = pruned_weight.to(device)
+        dense_time_pruned, dense_output_pruned = benchmark_dense_gemv(
+            vec_gpu, pruned_weight_gpu, num_warmup=10, num_iters=num_iters
+        )
+        
+        result['dense_time_pruned_ms'] = dense_time_pruned
+        result['speedup_vs_pruned'] = dense_time_pruned / sparse_time
+        
+        # Step 6: 测试dense baseline（原始）
+        if verbose:
+            print("Step 6: 测试dense GEMV (original)...")
+        
+        real_weight_gpu = real_weight.to(device)
+        dense_time_original, dense_output_original = benchmark_dense_gemv(
+            vec_gpu, real_weight_gpu, num_warmup=10, num_iters=num_iters
+        )
+        
+        result['dense_time_original_ms'] = dense_time_original
+        result['speedup_vs_original'] = dense_time_original / sparse_time
+        
+        # Step 7: 验证正确性
+        max_error = (sparse_output - dense_output_pruned).abs().max().item()
+        result['max_error'] = max_error
+        
+        result['success'] = True
+        
+        if verbose:
+            print(f"\n✓ 测试完成")
+            print(f"  Sparse: {sparse_time:.4f} ms")
+            print(f"  Dense (pruned): {dense_time_pruned:.4f} ms")
+            print(f"  Dense (original): {dense_time_original:.4f} ms")
+            print(f"  加速比 (vs pruned): {result['speedup_vs_pruned']:.3f}x")
+            print(f"  加速比 (vs original): {result['speedup_vs_original']:.3f}x")
+            print(f"  误差: {max_error:.6f}")
+        
+        # 清理GPU内存
+        del vec_gpu, mat_data_gpu, mat_index_gpu
+        del pruned_weight_gpu, real_weight_gpu
+        del sparse_output, dense_output_pruned, dense_output_original
+        torch.cuda.empty_cache()
+        
+    except Exception as e:
+        result['success'] = False
+        result['error_msg'] = str(e)
+        if verbose:
+            print(f"✗ 测试失败: {e}")
+    
+    return result
