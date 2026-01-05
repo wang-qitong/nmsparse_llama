@@ -12,15 +12,18 @@ import json
 from collections import defaultdict
 
 import torch
+import threading
+import torch.nn.functional as F
 from transformers import LlamaForCausalLM, AutoTokenizer
 from torch.utils.cpp_extension import load
+import torch.cuda.nvtx as nvtx
 
 # 添加工具函数路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nmsparse_test_utils import load_and_prune_weight, convert_to_sparse_format
 
 # ===== 配置 =====
-LLAMA_MODEL_PATH = "/home/wangqitong/llama_2-7b"
+LLAMA_MODEL_PATH = "/root/autodl-tmp/llama_2-7b"
 DEVICE = "cuda"
 DTYPE = torch.float32
 
@@ -29,16 +32,17 @@ NUM_DECODE_STEPS = 1
 NUM_WARMUP_DECODE = 0
 NUM_TEST_ITERATIONS = 100  # 每个模式测试的次数
 BATCH_SIZE = 1
-SEQ_LEN = 1024
+SEQ_LEN = 512
 
 # 稀疏化配置
 SPARSITY = 0.5
 NUM_BANK_VAL = 32
 NUM_THREADS = 128
-PROFILE_COMPONENTS = True  # 是否测量组件时间
+PROFILE_COMPONENTS = False  # 是否测量组件时间（禁用以避免CUDA Event overhead）
 
 # 获取测试模式
-TEST_MODE = os.getenv('E2E_MODE', 'sparse')
+TEST_MODE = os.getenv('E2E_MODE', 'dense_original')
+print(f"\n测试模式: {TEST_MODE}")
 if TEST_MODE not in ['sparse', 'dense_pruned', 'dense_original']:
     print(f"错误：无效的 E2E_MODE={TEST_MODE}")
     print("有效值: sparse, dense_pruned, dense_original")
@@ -104,20 +108,45 @@ print("\n加载 tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(LLAMA_MODEL_PATH)
 print("✓ Tokenizer 加载完成")
 
+# NVTX hooks 已禁用 - 只保留Python→C++→CUDA调用链的关键标记
+_ATTN_CTX = threading.local()
+
+# def install_attn_nvtx_hooks():
+#     """细粒度NVTX hooks已禁用，只保留主要调用链标记"""
+#     pass
+
+# # 安装 NVTX hooks
+# install_attn_nvtx_hooks()
+
 # ===== 加载或生成剪枝权重 =====
-pruned_cache_file = f"/home/wangqitong/pruned_weights_cache/sparse_params_sparsity{SPARSITY}_bank{NUM_BANK_VAL}.pt"
-PROJ_NAMES = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+pruned_cache_file = f"/root/autodl-tmp/sparse_params_sparsity0.5_bank32_mlp_qkvo.pt"
 
 if os.path.exists(pruned_cache_file):
     print(f"\n从缓存加载剪枝参数: {pruned_cache_file}")
     sparse_params = torch.load(pruned_cache_file, map_location='cpu')
     print(f"✓ 剪枝参数加载完成")
+    # 兼容旧缓存：重新计算派生的稀疏布局参数，确保与 kernel 假设一致
+    #   vec_width = NUM_BANK_VAL
+    #   block_width = int(NUM_BANK_VAL * (1 - SPARSITY))
+    #   w = block_width * num_bank
+    for layer_idx in range(num_layers):
+        for proj_name in sparse_params[layer_idx].keys():
+            entry = sparse_params[layer_idx][proj_name]
+            K = entry['K']
+            N = entry['N']
+            num_bank = K // NUM_BANK_VAL
+            num_nonzeros_per_bank = int(NUM_BANK_VAL * (1 - SPARSITY))
+            entry['w'] = num_bank * num_nonzeros_per_bank
+            entry['h'] = N
+            entry['block_width'] = num_nonzeros_per_bank
+            entry['vec_width'] = NUM_BANK_VAL
 else:
     print(f"\n缓存不存在，开始剪枝所有 32 层的 QKVO + MLP...")
     sparse_params = {}
     for layer_idx in range(num_layers):
         sparse_params[layer_idx] = {}
-        for proj_name in PROJ_NAMES:
+        # for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
+        for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
             real_weight, pruned_weight, pruned_mask, K, N = load_and_prune_weight(
                 model, layer_idx, proj_name, SPARSITY
             )
@@ -125,13 +154,13 @@ else:
                 pruned_weight, pruned_mask, NUM_BANK_VAL
             )
             
-            # 计算稀疏格式的参数，与实际稀疏矩阵一致
+            # 计算稀疏格式的参数
             num_bank = K // NUM_BANK_VAL
-            num_keep_per_bank = int(pruned_mask[:NUM_BANK_VAL, 0].sum())
-            w = num_keep_per_bank * num_bank  # 等价于 mat_data_cpu.shape[0]
+            num_nonzeros_per_bank = int(NUM_BANK_VAL * (1 - SPARSITY))
+            w = num_bank * num_nonzeros_per_bank
             h = N
-            block_width = num_keep_per_bank  # 每 bank 非零个数
-            vec_width = K * block_width // w  # 与 kernel 约定保持一致（通常为 32）
+            block_width = num_nonzeros_per_bank
+            vec_width = NUM_BANK_VAL
             sparse_params[layer_idx][proj_name] = {
                 'mat_data': mat_data_cpu,
                 'mat_index': mat_index_cpu,
@@ -143,18 +172,19 @@ else:
                 'K': K, 'N': N,
             }
         if (layer_idx + 1) % 8 == 0:
-            print(f"  ✓ Layer {layer_idx} 剪枝完成 (4 QKVO + 3 MLP)")
+            print(f"  ✓ Layer {layer_idx} 剪枝完成 (仅 4 个 QKVO 投影)")
     
     os.makedirs(os.path.dirname(pruned_cache_file), exist_ok=True)
     torch.save(sparse_params, pruned_cache_file)
     print(f"✓ 剪枝完成并保存到 {pruned_cache_file}")
-    print(f"   总共剪枝: {num_layers} 层 × 7 个投影 = {num_layers * 7} 个权重矩阵")
+    print(f"   总共剪枝: {num_layers} 层 × 4 个投影 = {num_layers * 4} 个权重矩阵 (仅 QKVO)")
 
 # 将稀疏参数移到 GPU
 print("\n将稀疏参数移到 GPU...")
 for layer_idx in range(num_layers):
     layer = model.model.layers[layer_idx]
-    for proj_name in PROJ_NAMES:
+    # for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
+    for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
         proj_entry = sparse_params[layer_idx][proj_name]
 
         if 'original_weight' not in proj_entry:
@@ -167,13 +197,8 @@ for layer_idx in range(num_layers):
 
         sparse_params[layer_idx][proj_name]['mat_data'] = sparse_params[layer_idx][proj_name]['mat_data'].to(DEVICE)
         sparse_params[layer_idx][proj_name]['mat_index'] = sparse_params[layer_idx][proj_name]['mat_index'].to(DEVICE)
-        # 将剪枝后的 dense 权重加载到模型中（用于 prefill / dense_pruned baseline）
-        if proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-            proj_module = getattr(layer.self_attn, proj_name)
-        else:
-            proj_module = getattr(layer.mlp, proj_name)
-        pruned_weight = sparse_params[layer_idx][proj_name]['pruned_weight']  # CPU: [K, N]
-        proj_module.weight.data = pruned_weight.T.to(DEVICE)  # Linear 权重是 [out, in]
+        sparse_params[layer_idx][proj_name]['pruned_weight'] = sparse_params[layer_idx][proj_name]['pruned_weight'].to(DEVICE)
+        # sparse_params[layer_idx][proj_name]['original_weight'] = sparse_params[layer_idx][proj_name]['original_weight'].to(DEVICE)
 print("✓ 稀疏参数已移到 GPU")
 
 
@@ -195,6 +220,8 @@ class SparsifiedLinear:
         self.bias = original_module.bias
     
     def __call__(self, x):
+        nvtx.range_push(f"PY::nmsparse_linear::{self.name}")
+        
         batch_size, seq_len, hidden_dim = x.shape
         x_2d = x.reshape(-1, hidden_dim)  # [B*L, K]
         minibatch = x_2d.shape[0]         # B*L
@@ -206,11 +233,13 @@ class SparsifiedLinear:
             _ee = torch.cuda.Event(enable_timing=True)
             _se.record()
         
+        nvtx.range_push("CPP::nmsparse_forward")
         output = self.nmsparse_module.forward(
             x_2d, self.mat_data, self.mat_index,
             self.w, self.h, self.block_width,
             NUM_THREADS, self.vec_width, minibatch, vecNum
-        )
+        )# nmsparse kernel
+        nvtx.range_pop()  # CPP::nmsparse_forward
         
         if self._timer_events is not None:
             _ee.record()
@@ -219,23 +248,43 @@ class SparsifiedLinear:
         if self.bias is not None:
             output = output + self.bias
         
-        output = output.view(batch_size, seq_len, -1)
+        output = output.contiguous().view(batch_size, seq_len, -1)
+        
+        nvtx.range_pop()  # PY::nmsparse_linear
         return output
 
 class _TimedForward:
-    """计时包装器"""
-    def __init__(self, original_forward, events_list):
+    """计时包装器（简化版，已移除细粒度NVTX hooks）"""
+    def __init__(self, original_forward, events_list, tag="PY::dense_linear"):
         self.original_forward = original_forward
         self.events_list = events_list
+        self.tag = tag
     
     def __call__(self, *args, **kwargs):
-        se = torch.cuda.Event(enable_timing=True)
-        ee = torch.cuda.Event(enable_timing=True)
-        se.record()
+        nvtx.range_push(self.tag)
+        
+        se, ee = None, None
+        if self.events_list is not None:
+            se = torch.cuda.Event(enable_timing=True)
+            ee = torch.cuda.Event(enable_timing=True)
+            se.record()
         result = self.original_forward(*args, **kwargs)
-        ee.record()
-        self.events_list.append((se, ee))
+        if self.events_list is not None:
+            ee.record()
+            self.events_list.append((se, ee))
+        
+        nvtx.range_pop()
         return result
+
+class _NVTXOnlyForward:
+    def __init__(self, original_forward, tag: str):
+        self.original_forward = original_forward
+        self.tag = tag
+    def __call__(self, *args, **kwargs):
+        nvtx.range_push(self.tag)
+        out = self.original_forward(*args, **kwargs)
+        nvtx.range_pop()
+        return out
 
 # 保存原始 forward 方法
 print("\n保存原始 forward 方法...")
@@ -333,7 +382,8 @@ def test_sparse():
     print("\n[Decode] 应用稀疏化...")
     for layer_idx in range(num_layers):
         layer = model.model.layers[layer_idx]
-        for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
+        # 只对QKVO投影应用稀疏化，MLP保持密集计算
+        for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:  # 'gate_proj', 'up_proj', 'down_proj']:
             proj_module = get_projection_module(layer, proj_name)
             sparse_linear = SparsifiedLinear(
                 proj_module, nmsparse_module,
@@ -341,17 +391,23 @@ def test_sparse():
                 f"layer{layer_idx}.{proj_name}",
                 qkvo_events if PROFILE_COMPONENTS else None
             )
-            proj_module.forward = sparse_linear
+            proj_module.forward = sparse_linear   # 替换为稀疏化版本
         
         if PROFILE_COMPONENTS:
             layer.self_attn.forward = _TimedForward(
-                original_block_forwards[layer_idx]['self_attn'], attn_events
+                original_block_forwards[layer_idx]['self_attn'], attn_events, "PY::self_attn"
             )
             layer.mlp.forward = _TimedForward(
-                original_block_forwards[layer_idx]['mlp'], mlp_events
+                original_block_forwards[layer_idx]['mlp'], mlp_events, "PY::mlp"
             )
+            for proj_name in ['gate_proj', 'up_proj', 'down_proj']:
+                proj_module = getattr(layer.mlp, proj_name)
+                proj_module.forward = _TimedForward(
+                    original_forwards[layer_idx][proj_name], None, f"PY::mlp::{proj_name}"
+                )
     print("✓ 稀疏化已应用")
-    print(f"  - nmSPARSE: 7 个投影 × 32 层 = 224 个矩阵 (包含 QKVO + MLP)")
+    print(f"  - nmSPARSE: 7 个投影 × 32 层 = 224 个矩阵 (QKVO + MLP 全部稀疏)")
+    print(f"  - 所有线性层均使用 nmSPARSE 计算")
     
     # Decode - 测试 100 次
     print(f"\n[Decode] 运行 {NUM_TEST_ITERATIONS} 次测试（每次 {NUM_DECODE_STEPS} steps）...")
@@ -359,6 +415,11 @@ def test_sparse():
     all_wall_times_ms = []
     tokens = []
     kvlen_before = int(attention_mask_tok.size(1))
+    
+    # 使用 NVTX 捕获范围 + 可选的 torch profiler（可通过环境变量关闭）
+    nvtx.range_push("CAPTURE")
+    if os.getenv('E2E_DISABLE_TORCH_PROFILER', '0') != '1':
+        torch.cuda.profiler.start()
     
     with torch.no_grad():
         for test_iter in range(NUM_TEST_ITERATIONS):
@@ -372,6 +433,9 @@ def test_sparse():
             
             torch.cuda.synchronize()
             t0 = time.perf_counter()
+            
+            # NVTX范围标记整个迭代（用于capture-range）
+            nvtx.range_push(f"DECODE_ITER_{test_iter}")
             start_event.record()
             
             for step in range(NUM_DECODE_STEPS):
@@ -380,8 +444,10 @@ def test_sparse():
                     device=decode_attn_mask.device,
                     dtype=decode_attn_mask.dtype,
                 )
+                
                 cur_attn_mask = torch.cat([decode_attn_mask, new_token_mask], dim=1)
                 
+                nvtx.range_push("PY::model_forward")
                 outputs = model(
                     input_ids=decode_input_ids,
                     past_key_values=decode_past,
@@ -389,6 +455,7 @@ def test_sparse():
                     use_cache=True,
                     return_dict=True,
                 )
+                nvtx.range_pop()  # PY::model_forward
                 
                 decode_past = outputs.past_key_values
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1)
@@ -400,6 +467,8 @@ def test_sparse():
                 decode_input_ids = next_token
             
             end_event.record()
+            nvtx.range_pop()  # DECODE_ITER_{test_iter}
+            
             torch.cuda.synchronize()
             iter_time_ms = start_event.elapsed_time(end_event)
             iter_wall_ms = (time.perf_counter() - t0) * 1000.0
@@ -409,6 +478,11 @@ def test_sparse():
             
             if (test_iter + 1) % 10 == 0:
                 print(f"  完成 {test_iter + 1}/{NUM_TEST_ITERATIONS} 次测试")
+    
+    # 停止 profiler / 关闭 CAPTURE 范围
+    if os.getenv('E2E_DISABLE_TORCH_PROFILER', '0') != '1':
+        torch.cuda.profiler.stop()
+    nvtx.range_pop()
     
     # 计算统计指标
     import numpy as np
@@ -487,12 +561,14 @@ def test_dense_pruned():
     qkvo_events, attn_events, mlp_events = [], [], []
     
     # 恢复原始 forward（权重已在优化阶段被替换为剪枝后权重）
-    print("\n[准备] 恢复 dense forward 方法...")
+    print("\n[准备] 恢复 dense forward 方法并加载剪枝后权重...")
     for layer_idx in range(num_layers):
         layer = model.model.layers[layer_idx]
         for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
             proj_module = get_projection_module(layer, proj_name)
             proj_module.forward = original_forwards[layer_idx][proj_name]
+            pruned_w = sparse_params[layer_idx][proj_name]['pruned_weight']
+            proj_module.weight.data = pruned_w.T.to(DEVICE)
             # 注意：权重已在显存优化阶段被替换为剪枝后权重，无需重新加载
         layer.self_attn.forward = original_block_forwards[layer_idx]['self_attn']
         layer.mlp.forward = original_block_forwards[layer_idx]['mlp']
@@ -630,6 +706,40 @@ def test_dense_original():
         layer.mlp.forward = original_block_forwards[layer_idx]['mlp']
     print("✓ 原始权重已加载")
     
+    # 为 dense_original 添加模块级别的 NVTX 包装（已移除投影级别的细粒度标记）
+    if PROFILE_COMPONENTS:
+        for layer_idx in range(num_layers):
+            layer = model.model.layers[layer_idx]
+            # 只保留模块级别的标记
+            layer.self_attn.forward = _TimedForward(
+                original_block_forwards[layer_idx]['self_attn'], None, "PY::self_attn"
+            )
+            layer.mlp.forward = _TimedForward(
+                original_block_forwards[layer_idx]['mlp'], None, "PY::mlp"
+            )
+    
+    # 为 dense_original 添加线性层的 NVTX 包装
+    def make_dense_linear_wrapper(layer_idx, proj_name):
+        """创建dense linear的NVTX包装器"""
+        original_forward = original_forwards[layer_idx][proj_name]
+        
+        def wrapped_forward(x):
+            nvtx.range_push(f"PY::dense_linear::layer{layer_idx}.{proj_name}")
+            output = original_forward(x)
+            nvtx.range_pop()  # PY::dense_linear::layerX.proj_name
+            return output
+        
+        return wrapped_forward
+    
+    # 为所有线性层添加NVTX包装
+    print("\n[准备] 为dense linear添加NVTX标记...")
+    for layer_idx in range(num_layers):
+        layer = model.model.layers[layer_idx]
+        for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']:
+            proj_module = get_projection_module(layer, proj_name)
+            proj_module.forward = make_dense_linear_wrapper(layer_idx, proj_name)
+    print("✓ Dense linear NVTX标记已添加")
+    
     # Prefill
     print("\n[Prefill] 生成 KV cache...")
     start_event = torch.cuda.Event(enable_timing=True)
@@ -658,6 +768,11 @@ def test_dense_original():
     tokens = []
     kvlen_before = int(attention_mask_tok.size(1))
     
+    # 使用 NVTX 捕获范围 + 可选的 torch profiler（可通过环境变量关闭）
+    nvtx.range_push("CAPTURE")
+    if os.getenv('E2E_DISABLE_TORCH_PROFILER', '0') != '1':
+        torch.cuda.profiler.start()
+    
     with torch.no_grad():
         for test_iter in range(NUM_TEST_ITERATIONS):
             decode_past = past_key_values
@@ -667,20 +782,32 @@ def test_dense_original():
             end_event = torch.cuda.Event(enable_timing=True)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
+            
+            nvtx.range_push(f"DECODE_ITER_{test_iter}")
             start_event.record()
+            
             for step in range(NUM_DECODE_STEPS):
                 new_token_mask = torch.ones((batch_size, 1), device=decode_attn_mask.device, dtype=decode_attn_mask.dtype)
+                
                 cur_attn_mask = torch.cat([decode_attn_mask, new_token_mask], dim=1)
+                
+                nvtx.range_push("PY::model_forward")
                 outputs = model(input_ids=decode_input_ids, past_key_values=decode_past,
                               attention_mask=cur_attn_mask, use_cache=True, return_dict=True)
+                nvtx.range_pop()  # PY::model_forward
+                
                 decode_past = outputs.past_key_values
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1)
                 if test_iter == 0:
                     tokens.append(next_token.detach())
                 next_token = next_token.unsqueeze(-1)
+                
                 decode_attn_mask = cur_attn_mask
                 decode_input_ids = next_token
+            
             end_event.record()
+            nvtx.range_pop()  # DECODE_ITER_{test_iter}
+            
             torch.cuda.synchronize()
             iter_time_ms = start_event.elapsed_time(end_event)
             iter_wall_ms = (time.perf_counter() - t0) * 1000.0
@@ -688,6 +815,11 @@ def test_dense_original():
             all_wall_times_ms.append(iter_wall_ms)
             if (test_iter + 1) % 10 == 0:
                 print(f"  完成 {test_iter + 1}/{NUM_TEST_ITERATIONS} 次测试")
+    
+    # 停止 profiler / 关闭 CAPTURE 范围
+    if os.getenv('E2E_DISABLE_TORCH_PROFILER', '0') != '1':
+        torch.cuda.profiler.stop()
+    nvtx.range_pop()
     
     import numpy as np
     total_ms = np.mean(all_times_ms)
