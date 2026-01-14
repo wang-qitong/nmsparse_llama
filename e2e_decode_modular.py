@@ -41,7 +41,7 @@ NUM_THREADS = 128
 PROFILE_COMPONENTS = False  # 是否测量组件时间（禁用以避免CUDA Event overhead）
 
 # 获取测试模式
-TEST_MODE = os.getenv('E2E_MODE', 'dense_original')
+TEST_MODE = os.getenv('E2E_MODE', 'sparse')
 print(f"\n测试模式: {TEST_MODE}")
 if TEST_MODE not in ['sparse', 'dense_pruned', 'dense_original']:
     print(f"错误：无效的 E2E_MODE={TEST_MODE}")
@@ -220,8 +220,6 @@ class SparsifiedLinear:
         self.bias = original_module.bias
     
     def __call__(self, x):
-        nvtx.range_push(f"PY::nmsparse_linear::{self.name}")
-        
         batch_size, seq_len, hidden_dim = x.shape
         x_2d = x.reshape(-1, hidden_dim)  # [B*L, K]
         minibatch = x_2d.shape[0]         # B*L
@@ -250,7 +248,6 @@ class SparsifiedLinear:
         
         output = output.contiguous().view(batch_size, seq_len, -1)
         
-        nvtx.range_pop()  # PY::nmsparse_linear
         return output
 
 class _TimedForward:
@@ -261,8 +258,6 @@ class _TimedForward:
         self.tag = tag
     
     def __call__(self, *args, **kwargs):
-        nvtx.range_push(self.tag)
-        
         se, ee = None, None
         if self.events_list is not None:
             se = torch.cuda.Event(enable_timing=True)
@@ -273,7 +268,6 @@ class _TimedForward:
             ee.record()
             self.events_list.append((se, ee))
         
-        nvtx.range_pop()
         return result
 
 class _NVTXOnlyForward:
@@ -281,9 +275,7 @@ class _NVTXOnlyForward:
         self.original_forward = original_forward
         self.tag = tag
     def __call__(self, *args, **kwargs):
-        nvtx.range_push(self.tag)
         out = self.original_forward(*args, **kwargs)
-        nvtx.range_pop()
         return out
 
 # 保存原始 forward 方法
@@ -416,8 +408,7 @@ def test_sparse():
     tokens = []
     kvlen_before = int(attention_mask_tok.size(1))
     
-    # 使用 NVTX 捕获范围 + 可选的 torch profiler（可通过环境变量关闭）
-    nvtx.range_push("CAPTURE")
+    # 可选的 torch profiler（可通过环境变量关闭）
     if os.getenv('E2E_DISABLE_TORCH_PROFILER', '0') != '1':
         torch.cuda.profiler.start()
     
@@ -434,8 +425,6 @@ def test_sparse():
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             
-            # NVTX范围标记整个迭代（用于capture-range）
-            nvtx.range_push(f"DECODE_ITER_{test_iter}")
             start_event.record()
             
             for step in range(NUM_DECODE_STEPS):
@@ -447,7 +436,6 @@ def test_sparse():
                 
                 cur_attn_mask = torch.cat([decode_attn_mask, new_token_mask], dim=1)
                 
-                nvtx.range_push("PY::model_forward")
                 outputs = model(
                     input_ids=decode_input_ids,
                     past_key_values=decode_past,
@@ -455,7 +443,6 @@ def test_sparse():
                     use_cache=True,
                     return_dict=True,
                 )
-                nvtx.range_pop()  # PY::model_forward
                 
                 decode_past = outputs.past_key_values
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1)
@@ -467,7 +454,6 @@ def test_sparse():
                 decode_input_ids = next_token
             
             end_event.record()
-            nvtx.range_pop()  # DECODE_ITER_{test_iter}
             
             torch.cuda.synchronize()
             iter_time_ms = start_event.elapsed_time(end_event)
@@ -479,10 +465,9 @@ def test_sparse():
             if (test_iter + 1) % 10 == 0:
                 print(f"  完成 {test_iter + 1}/{NUM_TEST_ITERATIONS} 次测试")
     
-    # 停止 profiler / 关闭 CAPTURE 范围
+    # 停止 profiler
     if os.getenv('E2E_DISABLE_TORCH_PROFILER', '0') != '1':
         torch.cuda.profiler.stop()
-    nvtx.range_pop()
     
     # 计算统计指标
     import numpy as np
@@ -724,9 +709,7 @@ def test_dense_original():
         original_forward = original_forwards[layer_idx][proj_name]
         
         def wrapped_forward(x):
-            nvtx.range_push(f"PY::dense_linear::layer{layer_idx}.{proj_name}")
             output = original_forward(x)
-            nvtx.range_pop()  # PY::dense_linear::layerX.proj_name
             return output
         
         return wrapped_forward
@@ -768,8 +751,7 @@ def test_dense_original():
     tokens = []
     kvlen_before = int(attention_mask_tok.size(1))
     
-    # 使用 NVTX 捕获范围 + 可选的 torch profiler（可通过环境变量关闭）
-    nvtx.range_push("CAPTURE")
+    # 可选的 torch profiler（可通过环境变量关闭）
     if os.getenv('E2E_DISABLE_TORCH_PROFILER', '0') != '1':
         torch.cuda.profiler.start()
     
@@ -783,7 +765,6 @@ def test_dense_original():
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             
-            nvtx.range_push(f"DECODE_ITER_{test_iter}")
             start_event.record()
             
             for step in range(NUM_DECODE_STEPS):
@@ -791,10 +772,8 @@ def test_dense_original():
                 
                 cur_attn_mask = torch.cat([decode_attn_mask, new_token_mask], dim=1)
                 
-                nvtx.range_push("PY::model_forward")
                 outputs = model(input_ids=decode_input_ids, past_key_values=decode_past,
                               attention_mask=cur_attn_mask, use_cache=True, return_dict=True)
-                nvtx.range_pop()  # PY::model_forward
                 
                 decode_past = outputs.past_key_values
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1)
@@ -806,7 +785,6 @@ def test_dense_original():
                 decode_input_ids = next_token
             
             end_event.record()
-            nvtx.range_pop()  # DECODE_ITER_{test_iter}
             
             torch.cuda.synchronize()
             iter_time_ms = start_event.elapsed_time(end_event)
@@ -816,10 +794,9 @@ def test_dense_original():
             if (test_iter + 1) % 10 == 0:
                 print(f"  完成 {test_iter + 1}/{NUM_TEST_ITERATIONS} 次测试")
     
-    # 停止 profiler / 关闭 CAPTURE 范围
+    # 停止 profiler
     if os.getenv('E2E_DISABLE_TORCH_PROFILER', '0') != '1':
         torch.cuda.profiler.stop()
-    nvtx.range_pop()
     
     import numpy as np
     total_ms = np.mean(all_times_ms)
