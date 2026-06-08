@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+outputs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.log
+*.bak
+*.bak_*
+*.tmp
+.ipynb_checkpoints/
