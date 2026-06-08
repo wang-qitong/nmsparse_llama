@@ -124,7 +124,7 @@ O(chunk_size)
 
 默认可以设为 `0` 保持旧行为，正式长生成时显式开启。
 
-在 `qwen3_32b_sequential_ar` 中替换单次：
+在 `ar_sparsegpt_sequential` 中替换单次：
 
 ```python
 generated = model.generate(..., max_new_tokens=max_new)
@@ -174,7 +174,7 @@ while remaining > 0:
 两 rank，每 rank 两张卡：
 
 ```bash
-python /wangqitong/sparsegpt-master_4/qwen3_32b_ar.py \
+python /wangqitong/sparsegpt-master_4/ar_sparsegpt.py \
     /wangqitong/qwen3-32b \
     longwriter_predjsonl \
     --ar_decoding \

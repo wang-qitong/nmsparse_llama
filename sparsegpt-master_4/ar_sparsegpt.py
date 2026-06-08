@@ -1,11 +1,12 @@
 """
-AR-decoding calibration for Qwen3-32B (Qwen3ForCausalLM).
+AR-decoding SparseGPT calibration for decoder-only causal language models.
 
-Adapted from qwen35_ar.py with changes for the text-only CausalLM variant:
-  1. Flat config: use_cache lives directly in model.config (no nested text_config).
-  2. No trust_remote_code needed for Qwen3ForCausalLM.
-  3. device_map="auto" retained for 32B multi-GPU distribution.
-  4. Hessians collected on each layer's own device (same as qwen35_ar.py).
+Expected Hugging Face model interface:
+  1. Transformer blocks are exposed through model.model.layers.
+  2. Token embeddings are exposed through model.model.embed_tokens.
+  3. use_cache is stored directly on model.config.
+  4. Models may be distributed across devices with device_map="auto".
+  5. Hessians are collected on each layer's assigned device.
 """
 
 import copy
@@ -51,7 +52,7 @@ except Exception:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def get_qwen3_32b(model_path, device_map="auto"):
+def get_causal_lm(model_path, device_map="auto"):
     def skip(*a, **k): pass
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
@@ -70,7 +71,7 @@ def get_qwen3_32b(model_path, device_map="auto"):
 # ---------------------------------------------------------------------------
 
 def _set_use_cache(model, value):
-    """Set use_cache on the flat config of Qwen3ForCausalLM."""
+    """Set use_cache on the model config."""
     model.config.use_cache = value
 
 
@@ -124,16 +125,14 @@ def _add_token_gpu_rank1(gpt, x, alpha=1.0):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def qwen3_32b_sequential_ar(model, prompts, tokenizer, dev, args):
+def ar_sparsegpt_sequential(model, prompts, tokenizer, dev, args):
     """
-    AR decoding calibration for Qwen3-32B (Qwen3ForCausalLM).
+    AR decoding calibration for a decoder-only Hugging Face CausalLM.
 
-    Differences from qwen35_sequential_ar:
-      - use_cache set directly via model.config (no nested text_config).
-      - model is already distributed by device_map="auto".
-      - Hessians collected on each layer's own device.
+    The model may already be distributed with device_map="auto"; Hessians
+    are collected and consumed on each transformer layer's assigned device.
     """
-    print("Starting Qwen3-32B AR decoding calibration ...")
+    print("Starting causal LM AR decoding calibration ...")
 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -167,7 +166,7 @@ def qwen3_32b_sequential_ar(model, prompts, tokenizer, dev, args):
                     args.wbits, perchannel=True, sym=False, mse=False
                 )
 
-    print(f"Tracking {len(gpts)} Linear layers for Qwen3-32B decoding-only calibration.")
+    print(f"Tracking {len(gpts)} Linear layers for causal LM decoding-only calibration.")
 
     # ---- Phase 1b: init Hessian storage ----
     if gpu_hessian:
@@ -617,17 +616,17 @@ def _collect_worker(rank, prompts_shard, model_path, tokenizer_path, args_dict, 
     device = torch.device('cuda:0')
     gpus_label = ",".join(map(str, gpu_ids)) if gpu_ids else str(rank)
     print(f"[rank {rank}] Loading model on GPU(s) {gpus_label} ...")
-    model = get_qwen3_32b(model_path, device_map="balanced")
+    model = get_causal_lm(model_path, device_map="balanced")
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     print(f"[rank {rank}] Collecting Hessians for {len(prompts_shard)} prompts ...")
-    qwen3_32b_sequential_ar(model, prompts_shard, tokenizer, device, args)
+    ar_sparsegpt_sequential(model, prompts_shard, tokenizer, device, args)
     print(f"[rank {rank}] Done.")
 
 
 @torch.no_grad()
-def qwen3_32b_eval(model, testenc, dev, dataset, log_wandb=False):
+def causal_lm_eval(model, testenc, dev, dataset, log_wandb=False):
     print("Evaluating ...")
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
@@ -664,8 +663,8 @@ if __name__ == "__main__":
 
     DEV = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
-    parser = argparse.ArgumentParser(description="SparseGPT AR calibration for Qwen3-32B")
-    parser.add_argument("model", type=str, help="Path to Qwen3-32B model")
+    parser = argparse.ArgumentParser(description="SparseGPT AR calibration for decoder-only causal language models")
+    parser.add_argument("model", type=str, help="Path to a Hugging Face causal language model")
     parser.add_argument("dataset", type=str,
                         choices=["wikitext2", "ptb", "c4", "longwriter_predjsonl"])
     parser.add_argument("--seed", type=int, default=0)
@@ -746,7 +745,7 @@ if __name__ == "__main__":
     world_size = getattr(args, 'ar_world_size', 1)
     gpus_per_rank = getattr(args, 'ar_gpus_per_rank', 1)
     if args.ar_decoding and world_size > 1:
-        hessian_dir = args.ar_hessian_dir or '/tmp/qwen3_hessians'
+        hessian_dir = args.ar_hessian_dir or '/tmp/ar_sparsegpt_hessians'
         os.makedirs(hessian_dir, exist_ok=True)
         data_subsets = [prompts[i::world_size] for i in range(world_size)]
         args_dict = {k: v for k, v in vars(args).items()
@@ -770,7 +769,7 @@ if __name__ == "__main__":
         args.ar_hessian_dir = hessian_dir
         args.ar_world_size = world_size
 
-    model = get_qwen3_32b(args.model)
+    model = get_causal_lm(args.model)
     model.eval()
 
     if not args.ar_decoding:
@@ -784,12 +783,12 @@ if __name__ == "__main__":
         if args.ar_decoding:
             # If parallel: prompts=[] triggers merge-only path via ar_hessian_dir
             prune_prompts = [] if world_size > 1 else prompts
-            _, baseline_artifacts = qwen3_32b_sequential_ar(
+            _, baseline_artifacts = ar_sparsegpt_sequential(
                 model, prune_prompts, tokenizer, DEV, args
             )
         else:
             raise ValueError(
-                "Non-AR calibration: use qwen3.py instead."
+                "Non-AR calibration: use the model-specific prefill calibration script instead."
             )
         print(f"Pruning took {time.time() - tick:.1f}s")
 
@@ -825,7 +824,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[WARN] Skip eval on {ds}: {e}"); continue
             print("Dataset:", ds)
-            qwen3_32b_eval(model, testloader, DEV, ds, args.log_wandb)
+            causal_lm_eval(model, testloader, DEV, ds, args.log_wandb)
 
     if args.save:
         gc = getattr(model, "generation_config", None)
